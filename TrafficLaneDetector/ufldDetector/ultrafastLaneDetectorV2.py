@@ -1,220 +1,349 @@
 import cv2
 import numpy as np
+import degirum as dg
+import os
 from typing import Tuple
-try :
-	from ufldDetector.utils import LaneModelType, OffsetType, lane_colors
-	from TrafficLaneDetector.ufldDetector.core import LaneDetectBase
-	from coreEngine import TensorRTEngine, OnnxEngine
-except :
-	import sys
-	from .utils import LaneModelType, OffsetType, lane_colors
-	from .core import LaneDetectBase
-	sys.path.append("..")
-	from coreEngine import TensorRTEngine, OnnxEngine
 
-def _softmax(x) :
-	# Note : 防止 overflow and underflow problem
-	x = x - np.max(x, axis=-1, keepdims=True) 
-	exp_x = np.exp(x)
-	return exp_x/np.sum(exp_x, axis=-1, keepdims=True)
+try:
+    from ufldDetector.utils import LaneModelType, OffsetType
+    from TrafficLaneDetector.ufldDetector.core import LaneDetectBase
+except:
+    import sys
+    from .utils import LaneModelType, OffsetType
+    from .core import LaneDetectBase
+    sys.path.append("..")
 
-class ModelConfig():
 
-	def __init__(self, model_type):
+def _softmax(x, axis=-1):
+    """
+    Numerically stable softmax.
+    """
+    x = x - np.max(x, axis=axis, keepdims=True)
+    exp_x = np.exp(x)
+    return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
 
-		if model_type == LaneModelType.UFLDV2_TUSIMPLE:
-			self.init_tusimple_config()
-		elif model_type == LaneModelType.UFLDV2_CURVELANES :
-			self.init_curvelanes_config()
-		else :
-			self.init_culane_config()
-		self.num_lanes = 4
 
-	def init_tusimple_config(self):
-		self.img_w = 800
-		self.img_h = 320
-		self.griding_num = 100
-		self.crop_ratio = 0.8
-		self.row_anchor = np.linspace(160,710, 56)/720
-		self.col_anchor = np.linspace(0,1, 41)
+def fit_lane_polynomial(lane_points, degree=2, num_samples=50):
+    """
+    Fits a polynomial (default quadratic) to lane_points and returns a smoothed set of (x, y).
+    """
+    if len(lane_points) < degree + 1:
+        # Not enough points to fit the chosen polynomial
+        return lane_points
 
-	def init_curvelanes_config(self) :
-		self.img_w = 1600
-		self.img_h = 800
-		self.griding_num = 200
-		self.crop_ratio = 0.8
-		self.row_anchor = np.linspace(0.4, 1, 72)
-		self.col_anchor = np.linspace(0, 1, 81)
-	
-	def init_culane_config(self):
-		self.img_w = 1600
-		self.img_h = 320
-		self.griding_num = 200
-		self.crop_ratio = 0.6
-		self.row_anchor = np.linspace(0.42, 1, 72)
-		self.col_anchor = np.linspace(0,1, 81)
+    xs = np.array([pt[0] for pt in lane_points], dtype=np.float32)
+    ys = np.array([pt[1] for pt in lane_points], dtype=np.float32)
+
+    # Sort points by y in descending order so we start from the bottom
+    sort_idx = np.argsort(ys)[::-1]
+    xs = xs[sort_idx]
+    ys = ys[sort_idx]
+
+    # Fit polynomial: x = f(y)
+    coeffs = np.polyfit(ys, xs, deg=degree)
+    poly_func = np.poly1d(coeffs)
+
+    # Resample from max(y) to min(y) to ensure we start from the bottom
+    y_max, y_min = ys[0], ys[-1]
+    y_new = np.linspace(y_max, y_min, num_samples)
+    x_new = poly_func(y_new)
+
+    return [(int(xn), int(yn)) for xn, yn in zip(x_new, y_new)]
+
+
+class ModelConfig:
+    """
+    Holds input dimensions, row anchors, etc., depending on the chosen UFLD model variant.
+    """
+    def __init__(self, model_type):
+        if model_type == LaneModelType.UFLDV2_TUSIMPLE:
+            self.init_tusimple_config()
+        elif model_type == LaneModelType.UFLDV2_CURVELANES:
+            self.init_curvelanes_config()
+        else:
+            self.init_culane_config()
+        self.num_lanes = 4
+
+    def init_tusimple_config(self):
+        # Typically 800 x 320 for TuSimple
+        self.img_w = 800
+        self.img_h = 320
+        self.griding_num = 100
+
+        # No cropping => we keep the entire image
+        self.crop_ratio = 1
+
+        # Row anchors from the top (0) to near-bottom (710) in 56 steps
+        self.row_anchor = np.linspace(0, 710, 56) / 720
+
+        self.col_anchor = np.linspace(0, 1, 41)
+
+    def init_curvelanes_config(self):
+        self.img_w = 1600
+        self.img_h = 800
+        self.griding_num = 200
+        self.crop_ratio = 0.8
+        self.row_anchor = np.linspace(0.4, 1, 72)
+        self.col_anchor = np.linspace(0, 1, 81)
+
+    def init_culane_config(self):
+        self.img_w = 800
+        self.img_h = 320
+        self.griding_num = 200
+        self.crop_ratio = 0.6
+        self.row_anchor = np.linspace(0.42, 1, 72)
+        self.col_anchor = np.linspace(0, 1, 81)
+
 
 class UltrafastLaneDetectorV2(LaneDetectBase):
-	_defaults = {
-		"model_path": "models/culane_res18.onnx",
-		"model_type" : LaneModelType.UFLDV2_TUSIMPLE,
-	}
+    """
+    Example class that loads a UFLDv2 HEF model and performs lane detection.
+    Integrates coordinate scaling, polynomial fitting, and an optional horizontal narrowing.
+    """
+    _defaults = {
+        "model_path": "models/ufld_v2.hef",
+        "model_type": LaneModelType.UFLDV2_TUSIMPLE,
+    }
 
-	def __init__(self, model_path : str = None, model_type : LaneModelType = None, logger = None):
-		LaneDetectBase.__init__(self, logger)
-		if (None not in [model_path, model_type]) :
-			self.model_path, self.model_type = model_path, model_type
+    def __init__(self, model_path: str = None, model_type: LaneModelType = None, logger=None):
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        # Base class init, which presumably sets up self.lane_info, etc.
+        LaneDetectBase.__init__(self, logger)
 
-		# Load model configuration based on the model type
-		if ( self.model_type not in [LaneModelType.UFLDV2_TUSIMPLE, LaneModelType.UFLDV2_CULANE]) :
-			if (self.logger) :
-				self.logger.error("UltrafastLaneDetectorV2 can't use %s type." % self.model_type.name)
-			raise Exception("UltrafastLaneDetectorV2 can't use %s type." % self.model_type.name)
-		self.cfg = ModelConfig(self.model_type)
+        self.model_path = model_path if model_path else self._defaults["model_path"]
+        self.model_type = model_type if model_type else self._defaults["model_type"]
 
-		# Initialize model
-		self._initialize_model(self.model_path)
-		
-	def _initialize_model(self, model_path : str) -> None:
-		if (self.logger) :
-			self.logger.debug("model path: %s." % model_path)
+        # Only TuSimple or CULane supported in this example
+        if self.model_type not in [LaneModelType.UFLDV2_TUSIMPLE, LaneModelType.UFLDV2_CULANE]:
+            msg = f"UltrafastLaneDetectorV2 can't use {self.model_type.name} type."
+            if self.logger:
+                self.logger.error(msg)
+            raise Exception(msg)
 
-		if model_path.endswith('.trt') :
-			self.engine = TensorRTEngine(model_path)
-		else :
-			self.engine = OnnxEngine(model_path)
+        # Build config
+        self.cfg = ModelConfig(self.model_type)
 
-		if (self.logger) :
-			self.logger.info(f'UfldDetectorV2 Type : [{self.engine.framework_type}] || Version : [{self.engine.providers}]')
-		# Set model info
-		self.set_input_details(self.engine)
-		self.set_output_details(self.engine)
+        # Load model
+        self._initialize_model(self.model_path)
 
-		if (len(self.output_names) != 4) :
-			raise Exception("Output dims is error, please check model. load %d channels not match 4." % len(self.output_names))
-		
-	def __prepare_input(self, image : cv2) -> np.ndarray :
-		img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-		self.img_height, self.img_width, self.img_channels = img.shape
+    def set_input_details(self):
+        """
+        Tells our code the required input dimensions for this model.
+        """
+        self.input_height = self.cfg.img_h
+        self.input_width = self.cfg.img_w
+        self.input_channels = 3
+        self.input_types = np.uint8
 
-		# Input values should be from -1 to 1 with a size of 288 x 800 pixels
-		new_size = ( self.input_width, int(self.input_height/self.cfg.crop_ratio))
-		img_input = cv2.resize(img, new_size).astype(np.float32)
-		img_input = img_input[-self.input_height:, :, :]
-		# Scale input pixel values to -1 to 1
-		mean=[0.485, 0.456, 0.406]
-		std=[0.229, 0.224, 0.225]
-		
-		img_input = ((img_input/ 255.0 - mean) / std)
-		img_input = img_input.transpose(2, 0, 1)
-		img_input = img_input[np.newaxis,:,:,:]        
+    def set_output_details(self, engine):
+        """
+        If needed, specify output names or shapes for your inference engine.
+        """
+        self.output_names = ['output']
+        self.output_shapes = [[1, 1, 1, 39576]]
 
-		return img_input.astype(self.input_types)
+    def _initialize_model(self, model_path: str) -> None:
+        """
+        Loads the HEF model via DeGirum's API.
+        """
+        if not model_path.endswith('.hef'):
+            raise Exception("Only HEF models are supported in this configuration.")
 
-	def __process_output(self, output, cfg : ModelConfig, local_width :int = 1) -> Tuple[np.ndarray, list]:
-		original_image_width = self.img_width
-		original_image_height = self.img_height
-		# output = np.array(output, dtype=np.float32) 
-		output = {"loc_row" : output[0], 'loc_col' : output[1], "exist_row" : output[2], "exist_col" : output[3]}
-		# print(output["loc_row"].shape)
-		# print(output["exist_row"].shape)
-		# print(output["loc_col"].shape)
-		# print(output["exist_col"].shape)
+        if self.logger:
+            self.logger.info(f"Loading HEF model from {model_path}")
 
-		batch_size, num_grid_row, num_cls_row, num_lane_row = output['loc_row'].shape
-		batch_size, num_grid_col, num_cls_col, num_lane_col = output['loc_col'].shape
+        try:
+            self.engine = dg.load_model(
+                model_name="ufld_v2",
+                inference_host_address="localhost",
+                zoo_url=""
+            )
+            self.set_input_details()
 
-		max_indices_row = output['loc_row'].argmax(1)
-		# n , num_cls, num_lanes
-		valid_row = output['exist_row'].argmax(1)
-		# n, num_cls, num_lanes
+            if self.logger:
+                self.logger.info(f"HEF model loaded successfully: {self.engine}")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"HEF model loading error: {e}")
+            raise
 
-		max_indices_col = output['loc_col'].argmax(1)
-		# n , num_cls, num_lanes
-		valid_col = output['exist_col'].argmax(1)
-		# n, num_cls, num_lanes
+    def __prepare_input(self, image: cv2.Mat) -> np.ndarray:
+        """
+        1) Convert BGR to RGB
+        2) Resize to (self.input_width, new_height)
+        3) Bottom-crop to get (self.input_width, self.input_height)
+        4) Expand dims => (1, H, W, 3)
+        """
+        img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-		output['loc_row'] = output['loc_row']
-		output['loc_col'] = output['loc_col']
-		row_lane_idx = [1,2]
-		col_lane_idx = [0,3]
+        new_height = int(self.input_height / self.cfg.crop_ratio)
+        img_resized = cv2.resize(img, (self.input_width, new_height), interpolation=cv2.INTER_CUBIC)
 
-		# Parse the output of the model
-		lanes_points = {"left-side" : [], "left-ego" : [] , "right-ego" : [], "right-side" : []}
-		# lanes_detected = []
-		lanes_detected =  {"left-side" : False, "left-ego" : False , "right-ego" : False, "right-side" : False}
-		for i in row_lane_idx:
-			tmp = []
-			if valid_row[0,:,i].sum() > num_cls_row / 2:
-				for k in range(valid_row.shape[1]):
-					if valid_row[0,k,i]:
-						all_ind = list(range(max(0,max_indices_row[0,k,i] - local_width), min(num_grid_row-1, max_indices_row[0,k,i] + local_width) + 1))
-						out_tmp = ( _softmax(output['loc_row'][0,all_ind,k,i]) * list(map(float, all_ind))).sum() + 0.5
-						out_tmp = out_tmp / (num_grid_row-1) * original_image_width
-						tmp.append((int(out_tmp), int(cfg.row_anchor[k] * original_image_height)))
-				if (i == 1) :
-					lanes_points["left-ego"].extend(tmp)
-					if (len(tmp) > 2) :
-						lanes_detected["left-ego"] = True
-				else :
-					lanes_points["right-ego"].extend(tmp)
-					if (len(tmp) > 2) :
-						lanes_detected["right-ego"] = True
+        # Keep the bottom self.input_height rows
+        img_cropped = img_resized[-self.input_height:, :, :]
+        input_tensor = np.expand_dims(img_cropped, axis=0)
+        return input_tensor.astype(self.input_types)
 
-		for i in col_lane_idx:
-			tmp = []
-			if valid_col[0,:,i].sum() > num_cls_col / 4:
-				for k in range(valid_col.shape[1]):
-					if valid_col[0,k,i]:
-						all_ind = list(range(max(0,max_indices_col[0,k,i] - local_width), min(num_grid_col-1, max_indices_col[0,k,i] + local_width) + 1))
-						out_tmp = ( _softmax(output['loc_col'][0,all_ind,k,i]) * list(map(float, all_ind))).sum() + 0.5
-						out_tmp = out_tmp / (num_grid_col-1) * original_image_height
-						tmp.append((int(cfg.col_anchor[k] * original_image_width), int(out_tmp)))
-				if (i == 0) :
-					lanes_points["left-side" ].extend(tmp)
-					if (len(tmp) > 2) :
-						lanes_detected["left-side"] = True
-				else :
-					lanes_points["right-side"].extend(tmp)
-					if (len(tmp) > 2) :
-						lanes_detected["right-side"] = True
-		return np.array(list(lanes_points.values()), dtype="object"), list(lanes_detected.values())
+    def __process_output(self, output, cfg: ModelConfig, original_image: cv2.Mat) -> Tuple[np.ndarray, list]:
+        """
+        - Dequantize
+        - Slice the raw output into row-loc, row-exist
+        - Convert to lane coordinates in the *original* frame
+        - Apply polynomial smoothing
+        - Return lane points + which lanes exist
+        """
+        # 1) Dequantize
+        output_entry = output.results[0]
+        raw_output = np.array(output_entry["data"], dtype=np.uint8)
+        scale = output_entry["quantization"]["scale"][0]
+        zero = output_entry["quantization"]["zero"][0]
+        dequant_output = (raw_output.astype(np.float32) - zero) * scale
 
-	def DetectFrame(self, image : cv2, adjust_lanes : bool = True) -> None:
-		input_tensor = self.__prepare_input(image)
+        flat_output = dequant_output.flatten()
 
-		# Perform inference on the image
-		output = self.engine.engine_inference(input_tensor)
+        # 2) Slicing logic
+        num_cell_row = 100
+        num_cell_col = 100
+        num_row = 56
+        num_col = 41
+        num_lanes = 4
 
-		# Process output data
-		self.lane_info.lanes_points, self.lane_info.lanes_status = self.__process_output(output, self.cfg)
-		
-		self.adjust_lanes = adjust_lanes
-		self._LaneDetectBase__update_lanes_status(self.lane_info.lanes_status)
-		self._LaneDetectBase__update_lanes_area(self.lane_info.lanes_points, self.img_height)
+        dim1 = num_cell_row * num_row * num_lanes
+        dim2 = num_cell_col * num_col * num_lanes
+        dim3 = 2 * num_row * num_lanes
+        dim4 = 2 * num_col * num_lanes
+        total_size = dim1 + dim2 + dim3 + dim4
 
-	def DrawDetectedOnFrame(self, image : cv2, type : OffsetType = OffsetType.UNKNOWN, alpha: float = 0.3) -> None:
-		overlay = image.copy()
-		for lane_num,lane_points in enumerate(self.lane_info.lanes_points):
-			
-			if ( lane_num==1 and type == OffsetType.RIGHT) :
-				color = (0, 0, 255)
-			elif (lane_num==2 and type == OffsetType.LEFT) :
-				color = (0, 0, 255)
-			else :
-				color = lane_colors[lane_num]
+        if flat_output.size != total_size:
+            raise ValueError(f"Expected {total_size} elements, got {flat_output.size}")
 
-			for lane_point in lane_points:
-				cv2.circle(overlay, (lane_point[0],lane_point[1]), 3, color, thickness=-1)
-		image[:] = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+        slice1 = flat_output[:dim1]
+        # slice2 = flat_output[dim1 : dim1 + dim2]  # not used in this snippet
+        slice3 = flat_output[dim1 + dim2 : dim1 + dim2 + dim3]
+        # slice4 = flat_output[dim1 + dim2 + dim3 : ]  # not used
 
-	def DrawAreaOnFrame(self, image : cv2, color : tuple = (255,191,0), alpha: float = 0.85) -> None :
-		H, W, _ = image.shape
-		# Draw a mask for the current lane
-		if(self.lane_info.area_status):
-			lane_segment_img = image.copy()
+        loc_row = np.reshape(slice1, (1, num_cell_row, num_row, num_lanes))
+        exist_row = np.reshape(slice3, (1, 2, num_row, num_lanes))
 
-			cv2.fillPoly(lane_segment_img, pts = [self.lane_info.area_points], color =color)
-			image[:H,:W,:] = cv2.addWeighted(image, alpha, lane_segment_img, 1-alpha, 0)
+        # 3) Convert to lane coordinates
+        exist_threshold = 0.7  # Increased threshold for better accuracy
+        local_width = 2
+
+        H, W, _ = original_image.shape
+        coords = []
+
+        # Use a horizontal narrowing factor < 1.0 to pull lines inward
+        horizontal_narrow_factor = 0.8
+        cx = W / 2.0
+
+        for lane_idx in range(num_lanes):
+            lane_points = []
+            for k in range(num_row):
+                row_logits = exist_row[0, :, k, lane_idx]  # shape (2,)
+                row_probs = _softmax(row_logits, axis=0)
+                if row_probs[1] > exist_threshold:
+                    loc_row_logits = loc_row[0, :, k, lane_idx]
+                    loc_row_argmax = np.argmax(loc_row_logits)
+                    all_ind = np.arange(
+                        max(0, loc_row_argmax - local_width),
+                        min(num_cell_row - 1, loc_row_argmax + local_width) + 1
+                    )
+                    row_softmax_vals = _softmax(loc_row_logits[all_ind], axis=0)
+                    weighted_index = np.sum(row_softmax_vals * all_ind)
+
+                    # Coordinates in the *input* 800x320 space
+                    x_coord_input = weighted_index / (num_cell_row - 1) * cfg.img_w
+                    y_coord_input = cfg.row_anchor[k] * cfg.img_h
+
+                    # Scale up to the original frame dimensions
+                    scale_x = W / cfg.img_w
+                    scale_y = H / cfg.img_h
+                    x_coord = x_coord_input * scale_x
+                    y_coord = y_coord_input * scale_y
+
+                    # Move x_coord closer to the center by factor < 1
+                    x_coord = cx + horizontal_narrow_factor * (x_coord - cx)
+
+                    # Round to int for final drawing
+                    x_coord = int(x_coord)
+                    y_coord = int(y_coord)
+
+                    lane_points.append((x_coord, y_coord))
+            coords.append(lane_points)
+
+        # 4) Polynomial fit & filtering
+        MIN_POINTS = 5
+        POLY_DEGREE = 2
+        final_lanes = []
+        lanes_detected = []
+
+        for lane_pts in coords:
+            if len(lane_pts) < MIN_POINTS:
+                final_lanes.append([])
+                lanes_detected.append(False)
+                continue
+            smoothed = fit_lane_polynomial(lane_pts, degree=POLY_DEGREE, num_samples=50)
+            final_lanes.append(smoothed)
+            lanes_detected.append(True)
+
+        return np.array(final_lanes, dtype="object"), lanes_detected
+
+    def DetectFrame(self, image: cv2.Mat, adjust_lanes: bool = True) -> None:
+        """
+        Main entry:
+        - Preprocess
+        - Inference
+        - Postprocess => self.lane_info.lanes_points, self.lane_info.lanes_status
+        """
+        input_tensor = self.__prepare_input(image)
+        output = self.engine.predict(input_tensor)
+
+        self.lane_info.lanes_points, self.lane_info.lanes_status = self.__process_output(
+            output, self.cfg, image
+        )
+        self.adjust_lanes = adjust_lanes
+
+    def DrawDetectedOnFrame(self, image: cv2.Mat, type: OffsetType = OffsetType.UNKNOWN, alpha: float = 0.3) -> None:
+        """
+        Draw the  lane points as green circles on top of the image, with alpha blending.
+        Then, if lanes #1 and #2 are detected, fill the region between them in green.
+        """
+        overlay = image.copy()
+        
+        # 1) Draw each lane's points in green circles
+        for lane_pts in self.lane_info.lanes_points:
+            for (x, y) in lane_pts:
+                cv2.circle(overlay, (x, y), 5, (0, 255, 0), -1)
+        cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, dst=image)
+
+        # 2) Fill area between lane 1 and lane 2 if both exist
+        #    Adjust indices if your main-lane boundaries differ
+        if len(self.lane_info.lanes_points) > 2:
+            if self.lane_info.lanes_status[1] and self.lane_info.lanes_status[2]:
+                lane_left = self.lane_info.lanes_points[1]
+                lane_right = self.lane_info.lanes_points[2]
+
+                # Sort by ascending y so the polygon is built properly
+                lane_left_sorted = sorted(lane_left, key=lambda p: p[1])
+                lane_right_sorted = sorted(lane_right, key=lambda p: p[1], reverse=True)
+
+                # Combine points: up the left boundary, then back down the right boundary
+                polygon_pts = np.array(lane_left_sorted + lane_right_sorted, dtype=np.int32)
+
+                fill_overlay = image.copy()
+                # Fill in solid green
+                cv2.fillPoly(fill_overlay, [polygon_pts], color=(0, 255, 0))
+                # Blend with the original image
+                cv2.addWeighted(fill_overlay, 0.4, image, 0.6, 0, dst=image)
 
 
+    def DrawAreaOnFrame(self, image: cv2.Mat, color: tuple = (255, 191, 0), alpha: float = 0.85) -> None:
+        """
+        If your pipeline computes a polygon or area between lanes (self.lane_info.area_points),
+        you can fill it here as well.
+        """
+        H, W, _ = image.shape
+        if getattr(self.lane_info, 'area_status', False):
+            lane_segment_img = image.copy()
+            cv2.fillPoly(lane_segment_img, pts=[self.lane_info.area_points], color=color)
+            cv2.addWeighted(lane_segment_img, 1 - alpha, image, alpha, 0, dst=image)

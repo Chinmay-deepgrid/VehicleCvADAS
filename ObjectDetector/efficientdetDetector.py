@@ -9,11 +9,11 @@ try :
 	from utils import ObjectModelType, hex_to_rgb, Scaler
 	from core import ObjectDetectBase, RectInfo
 	sys.path.append("..")
-	from coreEngine import OnnxEngine
+	#from coreEngine import OnnxEngine
 except :
-	from ObjectDetector.utils import ObjectModelType, hex_to_rgb, Scaler
-	from ObjectDetector.core import ObjectDetectBase, RectInfo
-	from coreEngine import OnnxEngine
+	from .utils import ObjectModelType, hex_to_rgb, Scaler
+	from .core import ObjectDetectBase, RectInfo
+	#from coreEngine import OnnxEngine
 	
 class EfficientdetDetector(ObjectDetectBase):
 	_defaults = {

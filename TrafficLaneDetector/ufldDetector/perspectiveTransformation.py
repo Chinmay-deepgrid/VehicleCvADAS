@@ -195,10 +195,18 @@ class PerspectiveTransformation(object):
             right_curverad = ((1 + (2*right_fit_cr[0]*y_eval*ym_per_pix + right_fit_cr[1])**2)**1.5) / np.absolute(2*right_fit_cr[0])
 
             curvature = ((left_curverad + right_curverad) / 2)
-            lane_width = np.absolute(leftx[719] - rightx[719])
+            if len(leftx) > 719 and len(rightx) > 719:
+                lane_width = np.absolute(leftx[719] - rightx[719])
+            else:
+                lane_width = np.absolute(leftx[-1] - rightx[-1])  # Use last valid index
+
 
             lane_xm_per_pix = 3.7 / lane_width
-            veh_pos = ((leftx[719] + rightx[719])  / 2.)
+            if len(leftx) > 719 and len(rightx) > 719:
+                veh_pos = ((leftx[719] + rightx[719]) / 2.)
+            else:
+                veh_pos = ((leftx[-1] + rightx[-1]) / 2.)  # Use last valid index
+
 
             cen_pos = (img.shape[1]/ 2.)
             distance_from_center = (veh_pos - cen_pos)* lane_xm_per_pix

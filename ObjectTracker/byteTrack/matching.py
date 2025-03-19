@@ -69,11 +69,11 @@ def iou_distance(atracks, btracks):
         atlbrs = [track.tlbr for track in atracks]
         btlbrs = [track.tlbr for track in btracks]
 
-    _ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float)
+    _ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float64)
     if _ious.size > 0:
         _ious = ious(
-            np.ascontiguousarray(atlbrs, dtype=np.float),
-            np.ascontiguousarray(btlbrs, dtype=np.float)
+            np.ascontiguousarray(atlbrs, dtype=np.float64),
+            np.ascontiguousarray(btlbrs, dtype=np.float64)
     )
     cost_matrix = 1 - _ious
 

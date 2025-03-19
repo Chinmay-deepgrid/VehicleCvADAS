@@ -1,0 +1,6 @@
+conda remove -n vcv --all
+conda create -n vcv python=3.10
+source ~/miniforge3/bin/activate
+conda activate vcv
+pip install -r requirements.txt
+python3 demo.py

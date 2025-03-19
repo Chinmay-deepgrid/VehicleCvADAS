@@ -1,0 +1,4 @@
+name: vcv
+channels:
+  - conda-forge
+prefix: /opt/conda/envs/vcv

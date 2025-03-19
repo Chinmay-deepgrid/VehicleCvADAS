@@ -1,7 +1,7 @@
 import cv2, time
 import numpy as np
 import logging
-import pycuda.driver as drv
+import degirum as dg  # DeGirum SDK for inference
 
 from ObjectTracker import BYTETracker
 from taskConditions import TaskConditions, Logger
@@ -14,19 +14,31 @@ from TrafficLaneDetector.ufldDetector.perspectiveTransformation import Perspecti
 from TrafficLaneDetector.ufldDetector.utils import LaneModelType, OffsetType, CurvatureType
 LOGGER = Logger(None, logging.INFO, logging.INFO )
 
-video_path = "./TrafficLaneDetector/temp/demo-7.mp4"
+video_path = "/home/chinmay/Downloads/video1.mp4"
+# Model configuration (using Hailo HEF models via DeGirum)
 lane_config = {
-	"model_path": "./TrafficLaneDetector/models/culane_res18_fp16.trt",
-	"model_type" : LaneModelType.UFLDV2_CULANE
+    "model_path": "./TrafficLaneDetector/models/ufld_v2.hef",
+    "model_type": LaneModelType.UFLDV2_CULANE
 }
 
 object_config = {
-	"model_path": './ObjectDetector/models/yolov10n-coco_fp16.trt',
-	"model_type" : ObjectModelType.YOLOV10,
-	"classes_path" : './ObjectDetector/models/coco_label.txt',
-	"box_score" : 0.4,
-	"box_nms_iou" : 0.5
+    "model_path": "./ObjectDetector/models/yolov8m.hef",
+    "model_type": ObjectModelType.YOLOV5,
+    "classes_path": "./ObjectDetector/models/coco_label.txt",
+    "box_score": 0.4,
+    "box_nms_iou": 0.5
 }
+ 
+# Initialize DeGirum server-based inference
+zoo_path = ""  # Using local server instead of model zoo
+inference_host = "localhost"  # DeGirum AI server must be running
+
+def load_model(model_name):
+    return dg.load_model(
+        model_name=model_name,
+        inference_host_address=inference_host,
+        zoo_url=zoo_path
+    )
 
 # Priority : FCWS > LDWS > LKAS
 class ControlPanel(object):
@@ -230,9 +242,9 @@ if __name__ == "__main__":
 	#==========================================================
 	#					Initialize Class
 	#==========================================================
-	LOGGER.info("[Pycuda] Cuda Version: {}".format(drv.get_version()))
-	LOGGER.info("[Driver] Cuda Version: {}".format(drv.get_driver_version()))
-	LOGGER.info("-"*40)
+	#LOGGER.info("[Pycuda] Cuda Version: {}".format(drv.get_version()))
+	#LOGGER.info("[Driver] Cuda Version: {}".format(drv.get_driver_version()))
+	#LOGGER.info("-"*40)
 
 	# lane detection model
 	LOGGER.info("Detector Model Type : {}".format(lane_config["model_type"].name))
