@@ -1,0 +1,31 @@
+{
+    "ConfigVersion": 10,
+    "Checksum": "d6c4d0b9620dc2e5e215dfab366510a740fe86bf2c5d9bd2059a6ba3fe62ee63",
+    "DEVICE": [
+        {
+            "DeviceType": "HAILO8", 
+            "RuntimeAgent": "HAILORT",
+            "SupportedDeviceTypes": "HAILORT/HAILO8"
+        }
+    ],
+    "PRE_PROCESS": [
+        {
+            "InputType": "Tensor",
+            "InputN": 1,
+            "InputH": 640,
+            "InputW": 640,
+            "InputC": 3,
+            "InputRawDataType": "DG_UINT8"
+        }
+    ],
+    "MODEL_PARAMETERS": [
+        {
+            "ModelPath": "yolov7.hef"
+        }
+    ],
+    "POST_PROCESS": [
+        {
+            "OutputPostprocessType": "None"
+        }
+    ]
+}
